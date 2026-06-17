@@ -6,5 +6,6 @@ sounddevice
 faster-whisper
 urllib3
 soniox
+websocket-client
 kivy
 pyperclip

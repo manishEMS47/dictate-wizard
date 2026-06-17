@@ -24,10 +24,12 @@ import pyperclip
 import time
 from faster_whisper import WhisperModel
 import urllib3
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from soniox.transcribe_live import transcribe_stream
 from soniox.speech_service import SpeechClient, set_api_key
+from websocket import create_connection
 from kivy.config import Config
 Config.set('graphics', 'width', '600')
 Config.set('graphics', 'height', '400')
@@ -50,6 +52,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 whisper_api_url = 'https://api.openai.com/v1/audio/transcriptions'
 conjecture_api_url = 'https://api.conjecture.dev/v1/transcriptions'
+sixtydb_stt_ws_url = 'wss://api.60db.ai/ws/stt'
 
 HOTKEY = KeyCode.from_char('x')
 MODIFIERS = {Key.alt, Key.ctrl}
@@ -66,6 +69,7 @@ class Provider(Enum):
     OPENAI = "OpenAI"
     CONJECTURE = "Conjecture"
     SONIOX = "Soniox"
+    SIXTYDB = "60db"
     
 @dataclass
 class ProviderConfig:
@@ -80,7 +84,7 @@ provider_config = ProviderConfig(main_provider=Provider.LOCAL_WHISPER, activated
     Provider.LOCAL_WHISPER})
 
 batch_providers = {Provider.CONJECTURE, Provider.LOCAL_WHISPER, Provider.OPENAI}
-streaming_providers = {Provider.SONIOX}
+streaming_providers = {Provider.SONIOX, Provider.SIXTYDB}
 
 class ModelSize(Enum):
     TINY = "tiny"
@@ -272,7 +276,7 @@ class RecorderGUI(BoxLayout):
         self.bind(modifiers=self.modifiers_value.setter('text'))
         
     def on_provider_dropdown_select(self, instance, x):
-        selected_provider = Provider[x.upper().replace(" ", "_")]
+        selected_provider = Provider(x)
         provider_config.main_provider = selected_provider
         self.provider_dropdown_button.text = f'Selected Main Provider: {selected_provider.value}'
         
@@ -402,8 +406,11 @@ class RecorderGUI(BoxLayout):
             with open("api_keys.json", "r") as f:
                 config = json.load(f)
             for provider in Provider:
-                self.provider_keys[provider.name] = config[provider.name.lower() + "_key"]
-                provider_keys[provider.name] = config[provider.name.lower() + "_key"]
+                # Tolerate configs saved before a provider existed (e.g. 60db) so
+                # one missing key doesn't abort loading every other provider's key.
+                key = config.get(provider.name.lower() + "_key", "")
+                self.provider_keys[provider.name] = key
+                provider_keys[provider.name] = key
             set_api_key(provider_keys["SONIOX"])
         except (FileNotFoundError, KeyError):
             print("API keys not found, please enter them manually")
@@ -474,33 +481,38 @@ class RecorderApp(App):
     def build(self):
         return RecorderGUI()
     
-audio_queue = Queue()
+# One queue per active streaming provider. A single shared queue would split
+# audio blocks between Soniox and 60db (each Queue.get() removes the block), so
+# we hand every streaming provider its own queue and feed each a copy.
+streaming_audio_queues: dict = {}
 
 def record_callback(indata, frames, time, status):
-    global audio, audio_queue
-    audio_queue.put(indata.copy())
+    global audio
     audio.append(indata.copy())
-    
-def iter_audio_queue() -> Iterable[bytes]:
-    while True:
-        audio = audio_queue.get()
-        if audio is None:
-            break
-        audio = np.ascontiguousarray(audio.astype(np.int16), "<h")
-        audio = audio.tobytes()
-        assert isinstance(audio, bytes)
-        yield audio
-        
-executor = ThreadPoolExecutor(max_workers=1)
+    for q in streaming_audio_queues.values():
+        q.put(indata.copy())
 
-def transcribe_audio_stream():
+def iter_audio_queue(q) -> Iterable[bytes]:
+    while True:
+        block = q.get()
+        if block is None:
+            break
+        block = np.ascontiguousarray(block.astype(np.int16), "<h")
+        block = block.tobytes()
+        assert isinstance(block, bytes)
+        yield block
+
+# Sized to run every streaming provider concurrently (Soniox + 60db + headroom).
+executor = ThreadPoolExecutor(max_workers=4)
+
+def transcribe_audio_stream(q):
     global start_time
     with SpeechClient() as client:
         transcript = ""
-        for result in transcribe_stream(iter_audio_queue(), 
-                                        client, 
-                                        audio_format="pcm_s16le", 
-                                        sample_rate_hertz=16000, 
+        for result in transcribe_stream(iter_audio_queue(q),
+                                        client,
+                                        audio_format="pcm_s16le",
+                                        sample_rate_hertz=16000,
                                         num_audio_channels=1):
             for word in result.words:
                 if word.is_final:
@@ -520,6 +532,81 @@ def transcribe_audio_stream():
         print(f"Transcription from {Provider.SONIOX.value}: {transcript}")
         print(f"Processing {Provider.SONIOX.value} transcription request took {time.time() - start_time:.2f} seconds")
 
+def transcribe_audio_stream_60db(q):
+    # Mirrors transcribe_audio_stream (Soniox) but over the 60db STT websocket.
+    # The same audio blocks (16 kHz, mono, 16-bit PCM) that feed Soniox are
+    # base64-wrapped and streamed up while final transcripts come back live.
+    global start_time
+    api_key = provider_keys[Provider.SIXTYDB.name]
+    try:
+        ws = create_connection(f"{sixtydb_stt_ws_url}?apiKey={api_key}")
+    except Exception as e:
+        print(f"60db websocket connection failed: {e}")
+        # Drain the queue so record_callback doesn't block on a full queue.
+        for _ in iter_audio_queue(q):
+            pass
+        return
+
+    # Collect finals keyed by sentence_id so the LLM-refined event for an
+    # utterance overwrites its earlier dict-corrected one instead of duplicating.
+    finals = {}
+    order = []
+    try:
+        ws.recv()  # connection_established
+        ws.send(json.dumps({
+            "type": "start",
+            "languages": ["en"],
+            "config": {"encoding": "linear", "sample_rate": 16000, "continuous_mode": True},
+        }))
+
+        def send_audio():
+            for chunk in iter_audio_queue(q):
+                ws.send(json.dumps({
+                    "type": "audio",
+                    "audio": base64.b64encode(chunk).decode("ascii"),
+                    "encoding": "linear",
+                    "sample_rate": 16000,
+                }))
+            ws.send(json.dumps({"type": "stop"}))
+
+        sender = Thread(target=send_audio)
+        sender.start()
+
+        while True:
+            try:
+                raw = ws.recv()
+            except Exception:
+                break
+            if not raw:
+                break
+            try:
+                msg = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if msg.get("is_final") and msg.get("text"):
+                sid = msg.get("sentence_id", len(order))
+                if sid not in finals:
+                    order.append(sid)
+                finals[sid] = msg["text"].strip()
+            if msg.get("type") in ("session_stopped", "complete", "error"):
+                break
+        sender.join()
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    transcript = " ".join(finals[sid] for sid in order).strip()
+    app = App.get_running_app()
+    app.root.provider_last_transcription[Provider.SIXTYDB.name] = f"{transcript}"
+    app.root.provider_processing_time[Provider.SIXTYDB.name] = f"{time.time() - start_time:.2f} s"
+    if Provider.SIXTYDB == provider_config.main_provider:
+        print_transcript(transcript)
+        app.root.processing_status = "Not Processing"
+    print(f"Transcription from {Provider.SIXTYDB.value}: {transcript}")
+    print(f"Processing {Provider.SIXTYDB.value} transcription request took {time.time() - start_time:.2f} seconds")
+
 def on_press(key):
     global current_pressed_modifiers, audio, is_recording, stream, HOTKEY, MODIFIERS, provider_config, batch_providers, streaming_providers
     if key in MODIFIERS:
@@ -531,14 +618,23 @@ def on_press(key):
         app.root.recording_status = "Recording"
         print("Hotkey pressed. Start recording.")
         audio = []
+        # Set up a queue + transcription task for each active streaming provider
+        # BEFORE the input stream starts feeding record_callback.
+        streaming_audio_queues.clear()
+        for provider in provider_config.activated_providers:
+            if provider in streaming_providers:
+                q = Queue()
+                streaming_audio_queues[provider] = q
+                if provider == Provider.SONIOX:
+                    executor.submit(transcribe_audio_stream, q)
+                elif provider == Provider.SIXTYDB:
+                    executor.submit(transcribe_audio_stream_60db, q)
         stream = sd.InputStream(samplerate=16000, channels=1,
                                 callback=record_callback, dtype='int16', blocksize=1280)
         stream.start()
-        if any(provider in provider_config.activated_providers for provider in streaming_providers):
-            executor.submit(transcribe_audio_stream)
 
 def on_release(key):
-    global current_pressed_modifiers, audio, audio_queue, is_recording, stream, HOTKEY, provider_config, batch_providers, streaming_providers, start_time
+    global current_pressed_modifiers, audio, is_recording, stream, HOTKEY, provider_config, batch_providers, streaming_providers, start_time
 
     if key in current_pressed_modifiers:
         current_pressed_modifiers.remove(key)
@@ -552,8 +648,8 @@ def on_release(key):
         start_time = time.time()
         stream.stop()
         stream.close()
-        if any(provider in provider_config.activated_providers for provider in streaming_providers):
-            audio_queue.put(None)
+        for q in streaming_audio_queues.values():
+            q.put(None)
         if any(provider in provider_config.activated_providers for provider in batch_providers):
             if audio:
                 audio_data = np.concatenate(audio, axis=0)
